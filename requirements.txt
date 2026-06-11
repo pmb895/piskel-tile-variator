@@ -1,0 +1,5 @@
+streamlit>=1.35.0
+pillow>=10.0.0
+numpy>=1.26.0
+opensimplex>=0.4.5
+streamlit-drawable-canvas>=0.9.3
