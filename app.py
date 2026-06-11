@@ -149,6 +149,84 @@ def generate_variation(
     out[lock_mask] = original[lock_mask]
     return out.astype(np.uint8)
 
+# ── object nudge / color swap ────────────────────────────────────────────────
+
+def build_label_map(arr: np.ndarray, palette: np.ndarray) -> np.ndarray:
+    H, W = arr.shape[:2]
+    label = np.full((H, W), -1, dtype=np.int32)
+    for i, color in enumerate(palette):
+        label[np.all(arr == color, axis=2)] = i
+    label[arr[:, :, 3] == 0] = -1
+    return label
+
+def generate_object_nudge(
+    original: np.ndarray,
+    palette: np.ndarray,
+    lock_mask: np.ndarray,
+    shift_amount: int,
+    seed: int,
+    excluded_indices: set | None = None,
+) -> np.ndarray:
+    H, W = original.shape[:2]
+    rng = np.random.default_rng(seed)
+    excluded = excluded_indices or set()
+    n = len(palette)
+    active = [i for i in range(n) if i not in excluded]
+
+    shifts = np.zeros((n, 2), dtype=np.int32)
+    if shift_amount > 0:
+        for i in active:
+            shifts[i] = rng.integers(-shift_amount, shift_amount + 1, size=2)
+
+    label_map = build_label_map(original, palette)
+
+    out = original.copy()
+    for i in range(n):
+        if i in excluded:
+            continue
+        dy, dx = shifts[i]
+        ys, xs = np.where(label_map == i)
+        if len(ys) == 0:
+            continue
+        new_ys = np.clip(ys + dy, 0, H - 1)
+        new_xs = np.clip(xs + dx, 0, W - 1)
+        out[new_ys, new_xs] = palette[i]
+
+    out[lock_mask] = original[lock_mask]
+    return out.astype(np.uint8)
+
+def generate_color_swap(
+    original: np.ndarray,
+    palette: np.ndarray,
+    lock_mask: np.ndarray,
+    seed: int,
+    excluded_indices: set | None = None,
+) -> np.ndarray:
+    H, W = original.shape[:2]
+    rng = np.random.default_rng(seed)
+    excluded = excluded_indices or set()
+    n = len(palette)
+    active = [i for i in range(n) if i not in excluded]
+
+    perm = list(range(n))
+    if len(active) > 1:
+        shuffled = active.copy()
+        rng.shuffle(shuffled)
+        for orig_idx, new_idx in zip(active, shuffled):
+            perm[orig_idx] = new_idx
+
+    label_map = build_label_map(original, palette)
+
+    out = original.copy()
+    for i in range(n):
+        ys, xs = np.where(label_map == i)
+        if len(ys) == 0:
+            continue
+        out[ys, xs] = palette[perm[i]]
+
+    out[lock_mask] = original[lock_mask]
+    return out.astype(np.uint8)
+
 # ── sprite sheet ─────────────────────────────────────────────────────────────
 
 def build_sprite_sheet(images: list[np.ndarray]) -> Image.Image:
@@ -281,6 +359,12 @@ if len(palette) == 0:
     st.warning("No opaque pixels found in layer 0.")
     st.stop()
 
+variation_mode = st.radio(
+    "Variation mode",
+    ["Simplex noise", "Object nudge", "Color swap"],
+    horizontal=True,
+)
+
 # ── slider guide ──────────────────────────────────────────────────────────────
 
 with st.expander("How do the controls work?"):
@@ -327,10 +411,14 @@ lock_left   = ec3.slider("Lock left cols",   0, 3, 0, key="lock_left")
 lock_right  = ec4.slider("Lock right cols",  0, 3, 0, key="lock_right")
 
 sc1, sc2, sc3, sc4 = st.columns(4)
-noise_scale = sc1.slider("Noise scale", 1, 10, 4, help="1 = large blobs, 10 = fine grain")
-drift_pct   = sc2.slider("Color drift %", 0, 100, 20, help="0 = match original proportions, 100 = uniform spread")
-num_vars    = sc3.selectbox("Variations", [4, 8, 16, 32], index=1)
-base_seed   = sc4.number_input("Base seed", min_value=0, max_value=99999, value=42, step=1)
+num_vars  = sc3.selectbox("Variations", [4, 8, 16, 32], index=1)
+base_seed = sc4.number_input("Base seed", min_value=0, max_value=99999, value=42, step=1)
+
+if variation_mode == "Simplex noise":
+    noise_scale = sc1.slider("Noise scale", 1, 10, 4, help="1 = large blobs, 10 = fine grain")
+    drift_pct   = sc2.slider("Color drift %", 0, 100, 20, help="0 = match original proportions, 100 = uniform spread")
+elif variation_mode == "Object nudge":
+    shift_amount = sc1.slider("Shift amount (px)", 0, 3, 1)
 
 st.divider()
 
@@ -345,22 +433,41 @@ if st.button("Generate variations", type="primary"):
         lock_mask = apply_canvas_locks(
             lock_mask, canvas_result.json_data["objects"], ZOOM, H, W
         )
-    drift = drift_pct / 100.0
+    if variation_mode == "Simplex noise":
+        drift = drift_pct / 100.0
 
     variation_arrays: list[np.ndarray] = []
     progress = st.progress(0, text="Generating…")
 
     for i in range(num_vars):
-        arr = generate_variation(
-            original=layer0_arr,
-            palette=palette,
-            proportions=proportions,
-            lock_mask=lock_mask,
-            noise_scale=noise_scale,
-            drift=drift,
-            seed=int(base_seed) + i,
-            excluded_indices=excluded_indices,
-        )
+        if variation_mode == "Simplex noise":
+            arr = generate_variation(
+                original=layer0_arr,
+                palette=palette,
+                proportions=proportions,
+                lock_mask=lock_mask,
+                noise_scale=noise_scale,
+                drift=drift,
+                seed=int(base_seed) + i,
+                excluded_indices=excluded_indices,
+            )
+        elif variation_mode == "Object nudge":
+            arr = generate_object_nudge(
+                original=layer0_arr,
+                palette=palette,
+                lock_mask=lock_mask,
+                shift_amount=shift_amount,
+                seed=int(base_seed) + i,
+                excluded_indices=excluded_indices,
+            )
+        else:  # Color swap
+            arr = generate_color_swap(
+                original=layer0_arr,
+                palette=palette,
+                lock_mask=lock_mask,
+                seed=int(base_seed) + i,
+                excluded_indices=excluded_indices,
+            )
         variation_arrays.append(arr)
         progress.progress((i + 1) / num_vars, text=f"Generating {i+1}/{num_vars}…")
 
