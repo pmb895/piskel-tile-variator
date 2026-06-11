@@ -114,9 +114,18 @@ def generate_variation(
     noise_scale: float,
     drift: float,
     seed: int,
+    excluded_indices: set | None = None,
 ) -> np.ndarray:
     H, W = original.shape[:2]
     gen = OpenSimplex(seed=seed)
+
+    # filter out excluded colors and re-normalize
+    active = [i for i in range(len(palette)) if i not in (excluded_indices or set())]
+    if not active:
+        active = list(range(len(palette)))
+    palette     = palette[active]
+    proportions = proportions[active]
+    proportions = proportions / proportions.sum()
 
     uniform = np.ones(len(palette)) / len(palette)
     weights = proportions * (1.0 - drift) + uniform * drift
@@ -159,18 +168,34 @@ def zoom(arr: np.ndarray, factor: int = ZOOM) -> Image.Image:
     H, W = arr.shape[:2]
     return Image.fromarray(arr, "RGBA").resize((W * factor, H * factor), Image.NEAREST)
 
-def palette_html(palette: np.ndarray, proportions: np.ndarray) -> str:
-    swatches = []
-    for color, pct in zip(palette, proportions):
-        r, g, b, a = color
-        hex_c = f"#{r:02x}{g:02x}{b:02x}"
-        swatches.append(
-            f'<span title="{hex_c} ({pct*100:.1f}%)" style="'
-            f"display:inline-block;width:20px;height:20px;"
-            f"background:{hex_c};margin:2px;border:1px solid #333;"
-            f'opacity:{a/255:.2f}"></span>'
-        )
-    return "".join(swatches)
+def palette_selector(palette: np.ndarray, proportions: np.ndarray) -> set:
+    """Renders interactive swatches with checkboxes. Returns set of excluded palette indices."""
+    n = len(palette)
+    swatches_per_row = min(n, 10)
+    excluded = set()
+    for row_start in range(0, n, swatches_per_row):
+        row_colors = palette[row_start : row_start + swatches_per_row]
+        row_props  = proportions[row_start : row_start + swatches_per_row]
+        cols = st.columns(len(row_colors))
+        for col_i, (color, pct) in enumerate(zip(row_colors, row_props)):
+            r, g, b, a = color
+            hex_c = f"#{r:02x}{g:02x}{b:02x}"
+            idx = row_start + col_i
+            key = f"excl_{hex_c[1:]}"
+            is_excl = st.session_state.get(key, False)
+            opacity = 0.2 if is_excl else round(a / 255, 2)
+            border  = "2px dashed #e00" if is_excl else "1px solid #444"
+            with cols[col_i]:
+                st.markdown(
+                    f'<div title="{hex_c} ({pct*100:.1f}%)" style="'
+                    f"width:24px;height:24px;background:{hex_c};"
+                    f'opacity:{opacity};border:{border};margin:auto"></div>',
+                    unsafe_allow_html=True,
+                )
+                st.checkbox("", key=key, label_visibility="collapsed")
+            if st.session_state.get(key, False):
+                excluded.add(idx)
+    return excluded
 
 # ── main UI ───────────────────────────────────────────────────────────────────
 
@@ -241,9 +266,16 @@ with preview_col:
     st.caption(f"{locked_count} / {H*W} pixels locked ({locked_count*100//(H*W)}%)")
 
 with pal_col:
-    st.markdown(f"**Palette — {len(palette)} colors** (sorted by frequency)")
-    st.markdown(palette_html(palette, proportions), unsafe_allow_html=True)
-    st.caption(f"{W}×{H} px · {num_layers} layer(s) · hover swatches for hex + %")
+    st.markdown(f"**Palette — {len(palette)} colors** (check to exclude from generation)")
+    excluded_indices = palette_selector(palette, proportions)
+    active_count = len(palette) - len(excluded_indices)
+    st.caption(f"{active_count} / {len(palette)} colors active · {W}×{H} px · {num_layers} layer(s)")
+    if excluded_indices:
+        if st.button("Reset exclusions"):
+            for key in list(st.session_state.keys()):
+                if key.startswith("excl_"):
+                    del st.session_state[key]
+            st.rerun()
 
 if len(palette) == 0:
     st.warning("No opaque pixels found in layer 0.")
@@ -304,6 +336,9 @@ st.divider()
 
 # ── generate ──────────────────────────────────────────────────────────────────
 
+if len(excluded_indices) == len(palette):
+    st.warning("All colors are excluded — generation will use the full palette as fallback.")
+
 if st.button("Generate variations", type="primary"):
     lock_mask = build_lock_mask(H, W, lock_top, lock_bottom, lock_left, lock_right)
     if canvas_result.json_data and canvas_result.json_data.get("objects"):
@@ -324,6 +359,7 @@ if st.button("Generate variations", type="primary"):
             noise_scale=noise_scale,
             drift=drift,
             seed=int(base_seed) + i,
+            excluded_indices=excluded_indices,
         )
         variation_arrays.append(arr)
         progress.progress((i + 1) / num_vars, text=f"Generating {i+1}/{num_vars}…")
